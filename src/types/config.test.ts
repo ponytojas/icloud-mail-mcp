@@ -45,6 +45,7 @@ describe('Config Types', () => {
         to: ['recipient@example.com'],
         subject: 'Test Subject',
         body: 'Test body content',
+        bodyTruncated: false,
         date: new Date('2024-01-01'),
         flags: ['\\Seen'],
       };
@@ -59,10 +60,10 @@ describe('Config Types', () => {
 
     it('should accept email message with attachments', () => {
       const attachment: Attachment = {
+        index: 0,
         filename: 'test.txt',
         contentType: 'text/plain',
         size: 1024,
-        data: Buffer.from('test content'),
       };
 
       const message: EmailMessage = {
@@ -71,6 +72,7 @@ describe('Config Types', () => {
         to: ['recipient@example.com'],
         subject: 'Test Subject',
         body: 'Test body content',
+        bodyTruncated: false,
         date: new Date('2024-01-01'),
         flags: ['\\Seen'],
         attachments: [attachment],
@@ -204,16 +206,15 @@ describe('Config Types', () => {
   describe('Attachment', () => {
     it('should create valid attachment', () => {
       const attachment: Attachment = {
+        index: 0,
         filename: 'document.pdf',
         contentType: 'application/pdf',
         size: 2048,
-        data: Buffer.from('PDF content'),
       };
 
       expect(attachment.filename).toBe('document.pdf');
       expect(attachment.contentType).toBe('application/pdf');
       expect(attachment.size).toBe(2048);
-      expect(Buffer.isBuffer(attachment.data)).toBe(true);
     });
   });
 });

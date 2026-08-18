@@ -2,6 +2,7 @@
 
 import { build } from 'esbuild';
 import { spawn } from 'child_process';
+import { rm } from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -34,7 +35,7 @@ async function buildBundle() {
       entryPoints: [path.join(projectRoot, 'src/index.ts')],
       bundle: true,
       platform: 'node',
-      target: 'node18',
+      target: 'node22',
       format: 'esm',
       outfile: path.join(projectRoot, 'dist/index.js'),
       external: [
@@ -59,7 +60,10 @@ async function buildTypes() {
   console.log('[TYPES] Generating type definitions...');
 
   try {
-    await runCommand('npx', ['tsc', '--emitDeclarationOnly']);
+    await runCommand(process.execPath, [
+      path.join(projectRoot, 'node_modules/typescript/bin/tsc'),
+      '--emitDeclarationOnly',
+    ]);
     console.log('[SUCCESS] Type definitions generated successfully');
   } catch (error) {
     console.error('[ERROR] Type generation failed:', error);
@@ -70,6 +74,8 @@ async function buildTypes() {
 async function main() {
   try {
     console.log('[START] Starting build process...');
+
+    await rm(path.join(projectRoot, 'dist'), { recursive: true, force: true });
 
     // Run builds in parallel for faster execution
     await Promise.all([buildBundle(), buildTypes()]);

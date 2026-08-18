@@ -1,541 +1,657 @@
 import Imap from 'imap';
-import {
-  simpleParser,
-  ParsedMail,
-  Attachment as MailparserAttachment,
-  AddressObject as MailparserAddressObject,
-} from 'mailparser';
+import { MailParser, type AddressObject, type Headers } from 'mailparser';
 import nodemailer from 'nodemailer';
-import {
-  iCloudConfig,
-  EmailMessage,
-  SendEmailOptions,
+import { PassThrough } from 'node:stream';
+import { configSchema } from '../schemas.js';
+import type {
   Attachment,
-  SearchOptions,
+  EmailMessage,
+  iCloudConfig,
   OrganizationRule,
+  SearchOptions,
+  SendEmailOptions,
 } from '../types/config.js';
 
-// Type definitions for IMAP
+const DEFAULT_OPERATION_TIMEOUT_MS = 30_000;
+const DEFAULT_BODY_LIMIT_BYTES = 100 * 1024;
+const ATTACHMENT_LIMIT_BYTES = 10 * 1024 * 1024;
+
 interface ImapBox {
   attribs: string[];
   delimiter: string;
   children?: ImapBoxes;
-  parent?: ImapBox;
 }
 
 interface ImapBoxes {
   [boxName: string]: ImapBox;
 }
 
+export interface MailboxInfo {
+  name: string;
+  attributes: string[];
+  delimiter: string;
+  children?: MailboxInfo[];
+}
+
+interface ImapMessageAttributes {
+  uid?: number;
+  flags?: string[];
+  date?: Date;
+  struct?: unknown[];
+}
+
 interface ImapMessage {
-  on(
-    event: 'body',
-    listener: (stream: NodeJS.ReadableStream, info: object) => void
-  ): this;
-  on(
-    event: 'attributes',
-    listener: (attrs: ImapMessageAttributes) => void
-  ): this;
-  once(event: 'end', listener: () => void): this;
+  on(event: 'body', listener: (stream: NodeJS.ReadableStream) => void): this;
   once(
     event: 'attributes',
     listener: (attrs: ImapMessageAttributes) => void
   ): this;
+  once(event: 'end', listener: () => void): this;
 }
 
-interface ImapMessageAttributes {
-  flags?: string[];
-  date?: Date;
-  struct?: unknown[];
+interface MimePart {
+  partID?: string;
+  type?: string;
+  subtype?: string;
+  encoding?: string;
   size?: number;
+  params?: Record<string, string>;
+  disposition?: {
+    type?: string;
+    params?: Record<string, string>;
+  };
 }
 
-// Remove unused ImapFetch interface
+export interface OperationResult {
+  status: 'success';
+  message: string;
+}
 
-// Use mailparser's AddressObject type instead
+export interface AttachmentResult extends OperationResult {
+  attachment: {
+    filename: string;
+    contentType: string;
+    size: number;
+    data: string;
+  };
+}
+
+export interface OrganizationResult {
+  status: 'success' | 'partial';
+  message: string;
+  results: Array<{
+    rule: string;
+    matchedMessages: number;
+    moved: boolean;
+    error?: string;
+    messages?: Array<{
+      id: string;
+      from: string;
+      subject: string;
+      destinationMailbox: string;
+    }>;
+  }>;
+}
+
+export interface MailClientOptions {
+  operationTimeoutMs?: number;
+  bodyLimitBytes?: number;
+  attachmentLimitBytes?: number;
+}
 
 export class iCloudMailClient {
   private imap: Imap;
-  private transporter: nodemailer.Transporter;
-  private config: iCloudConfig;
+  private readonly transporter: nodemailer.Transporter;
+  private readonly config: Required<iCloudConfig>;
+  private readonly operationTimeoutMs: number;
+  private readonly bodyLimitBytes: number;
+  private readonly attachmentLimitBytes: number;
+  private isConnected = false;
+  private connectionPromise: Promise<void> | null = null;
+  private operationQueue: Promise<void> = Promise.resolve();
+  private shuttingDown = false;
+  private connectionInvalidated = false;
+  private imapUser: string;
 
-  constructor(config: iCloudConfig) {
-    this.config = config;
-
-    // For IMAP, try email name first (e.g., "johnappleseed"), fallback to full email
-    const imapUsername = this.extractEmailName(config.email);
-
-    this.imap = new Imap({
-      user: imapUsername,
-      password: config.appPassword,
-      host: config.imapHost || 'imap.mail.me.com',
-      port: config.imapPort || 993,
-      tls: true,
-      tlsOptions: {
-        servername: config.imapHost || 'imap.mail.me.com',
-        rejectUnauthorized: false, // Allow self-signed certificates if needed
-      },
-      authTimeout: 30000, // 30 seconds timeout
-      connTimeout: 30000,
-    });
-
+  constructor(config: iCloudConfig, options: MailClientOptions = {}) {
+    this.config = configSchema.parse(config);
+    this.operationTimeoutMs =
+      options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS;
+    this.bodyLimitBytes = options.bodyLimitBytes ?? DEFAULT_BODY_LIMIT_BYTES;
+    this.attachmentLimitBytes =
+      options.attachmentLimitBytes ?? ATTACHMENT_LIMIT_BYTES;
+    this.imapUser = this.extractEmailName(this.config.email);
+    this.imap = this.createImap(this.imapUser);
     this.transporter = nodemailer.createTransport({
-      host: config.smtpHost || 'smtp.mail.me.com',
-      port: config.smtpPort || 587,
-      secure: false, // Use STARTTLS
-      requireTLS: true, // Force TLS
-      auth: {
-        user: config.email, // SMTP requires full email address
-        pass: config.appPassword,
-      },
-      tls: {
-        rejectUnauthorized: false, // Allow self-signed certificates if needed
-      },
+      host: this.config.smtpHost,
+      port: this.config.smtpPort,
+      secure: false,
+      requireTLS: true,
+      auth: { user: this.config.email, pass: this.config.appPassword },
+      tls: { rejectUnauthorized: true },
     });
   }
 
   private extractEmailName(email: string): string {
-    // Extract username part from email (e.g., "john@icloud.com" -> "john")
-    const atIndex = email.indexOf('@');
-    return atIndex > 0 ? email.substring(0, atIndex) : email;
+    return email.slice(0, email.indexOf('@'));
+  }
+
+  private createImap(user: string): Imap {
+    const imap = new Imap({
+      user,
+      password: this.config.appPassword,
+      host: this.config.imapHost,
+      port: this.config.imapPort,
+      tls: true,
+      tlsOptions: {
+        servername: this.config.imapHost,
+        rejectUnauthorized: true,
+      },
+      authTimeout: this.operationTimeoutMs,
+      connTimeout: this.operationTimeoutMs,
+    });
+
+    imap.on('error', (error: Error) => {
+      if (this.imap !== imap) return;
+      if (this.isConnected) console.error('IMAP connection error:', error);
+      this.isConnected = false;
+      this.connectionInvalidated = true;
+    });
+    imap.on('close', () => {
+      if (this.imap !== imap) return;
+      this.isConnected = false;
+      this.connectionInvalidated = true;
+    });
+    imap.on('end', () => {
+      if (this.imap !== imap) return;
+      this.isConnected = false;
+      this.connectionInvalidated = true;
+    });
+    return imap;
+  }
+
+  private isAuthenticationError(error: Error): boolean {
+    return /authenticat|invalid credentials|login failed/iu.test(error.message);
+  }
+
+  private connectAttempt(imap: Imap): Promise<void> {
+    return this.withTimeout(
+      new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const succeed = () => {
+          if (settled) return;
+          settled = true;
+          this.isConnected = true;
+          this.connectionInvalidated = false;
+          resolve();
+        };
+        const fail = (error: Error) => {
+          if (settled) return;
+          settled = true;
+          this.isConnected = false;
+          reject(error);
+        };
+        imap.once('ready', succeed);
+        imap.once('error', fail);
+        imap.connect();
+      }),
+      'IMAP connection'
+    );
   }
 
   async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.imap.once('ready', () => {
-        console.error('IMAP connection ready');
-        resolve();
-      });
+    if (this.shuttingDown) throw new Error('Mail client is shutting down');
+    if (this.isConnected) return;
+    if (this.connectionPromise) return this.connectionPromise;
+    if (this.connectionInvalidated) {
+      this.imap.destroy();
+      this.imap = this.createImap(this.imapUser);
+      this.connectionInvalidated = false;
+    }
 
-      this.imap.once('error', (err: Error) => {
-        console.error('IMAP connection error:', err);
-
-        // Try with full email if username-only failed
+    const connection = (async () => {
+      try {
+        await this.connectAttempt(this.imap);
+      } catch (error) {
+        const initialError =
+          error instanceof Error ? error : new Error(String(error));
+        const shortUser = this.extractEmailName(this.config.email);
         if (
-          err.message.includes('authenticate') ||
-          err.message.includes('Invalid credentials')
+          !this.isAuthenticationError(initialError) ||
+          shortUser === this.config.email
         ) {
-          console.error('Retrying IMAP connection with full email address...');
-
-          // Recreate IMAP with full email
-          this.imap = new Imap({
-            user: this.config.email, // Use full email instead of username
-            password: this.config.appPassword,
-            host: this.config.imapHost || 'imap.mail.me.com',
-            port: this.config.imapPort || 993,
-            tls: true,
-            tlsOptions: {
-              servername: this.config.imapHost || 'imap.mail.me.com',
-              rejectUnauthorized: false,
-            },
-            authTimeout: 30000,
-            connTimeout: 30000,
-          });
-
-          // Try connecting again with full email
-          this.imap.once('ready', () => {
-            console.error('IMAP connection ready (with full email)');
-            resolve();
-          });
-
-          this.imap.once('error', (retryErr: Error) => {
-            console.error(
-              'IMAP connection failed even with full email:',
-              retryErr
-            );
-            reject(
-              new Error(
-                `IMAP authentication failed. Please check your app-specific password and ensure two-factor authentication is enabled. Details: ${retryErr.message}`
-              )
-            );
-          });
-
-          this.imap.connect();
-        } else {
-          reject(new Error(`IMAP connection failed: ${err.message}`));
+          throw new Error(`IMAP connection failed: ${initialError.message}`);
         }
-      });
 
-      this.imap.connect();
-    });
-  }
-
-  async testConnection(): Promise<{ status: string; message: string }> {
-    try {
-      console.error('Testing IMAP connection...');
-      await this.connect();
-      console.error('IMAP connection successful, disconnecting...');
-      await this.disconnect();
-
-      console.error('Testing SMTP connection...');
-      // Test SMTP connection with timeout
-      await Promise.race([
-        this.transporter.verify(),
-        new Promise((_, reject) =>
-          setTimeout(
-            () =>
-              reject(new Error('SMTP verification timeout after 30 seconds')),
-            30000
-          )
-        ),
-      ]);
-
-      console.error('SMTP connection successful');
-
-      return {
-        status: 'success',
-        message:
-          'Email connection test successful - both IMAP and SMTP are working',
-      };
-    } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      console.error('Connection test failed:', errorMessage);
-
-      // Provide helpful error messages based on common issues
-      let helpfulMessage = errorMessage;
-      if (
-        errorMessage.includes('authenticate') ||
-        errorMessage.includes('Invalid credentials')
-      ) {
-        helpfulMessage +=
-          "\n\nTroubleshooting:\n1. Ensure you're using an app-specific password, not your regular Apple ID password\n2. Verify that two-factor authentication is enabled on your Apple ID\n3. Generate a new app-specific password if the current one isn't working\n4. Check that your Apple ID hasn't been locked";
-      } else if (
-        errorMessage.includes('timeout') ||
-        errorMessage.includes('ENOTFOUND') ||
-        errorMessage.includes('ECONNREFUSED')
-      ) {
-        helpfulMessage +=
-          '\n\nTroubleshooting:\n1. Check your internet connection\n2. Verify firewall settings allow connections to iCloud mail servers\n3. Try connecting from a different network';
+        this.imap.destroy();
+        this.imapUser = this.config.email;
+        this.imap = this.createImap(this.config.email);
+        try {
+          await this.connectAttempt(this.imap);
+        } catch (retryError) {
+          const detail =
+            retryError instanceof Error
+              ? retryError.message
+              : String(retryError);
+          throw new Error(
+            `IMAP authentication failed. Check the app-specific password and two-factor authentication. Details: ${detail}`
+          );
+        }
       }
+    })();
 
-      return {
-        status: 'error',
-        message: helpfulMessage,
-      };
+    this.connectionPromise = connection;
+    try {
+      await connection;
+    } finally {
+      this.connectionPromise = null;
     }
   }
 
+  private withTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.isConnected = false;
+        this.imap.destroy();
+        reject(
+          new Error(
+            `${operation} timed out after ${this.operationTimeoutMs} milliseconds`
+          )
+        );
+      }, this.operationTimeoutMs);
+      promise.then(
+        (value) => {
+          clearTimeout(timeout);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      );
+    });
+  }
+
+  private runSerialized<T>(
+    operation: string,
+    action: () => Promise<T>
+  ): Promise<T> {
+    const run = this.operationQueue.then(async () => {
+      await this.connect();
+      return this.withTimeout(action(), operation);
+    });
+    this.operationQueue = run.then(
+      () => undefined,
+      () => undefined
+    );
+    return run;
+  }
+
   async disconnect(): Promise<void> {
-    return new Promise((resolve) => {
+    this.shuttingDown = true;
+    await this.operationQueue;
+    if (!this.isConnected) {
+      this.imap.destroy();
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, 2_000);
       this.imap.once('end', () => {
+        clearTimeout(timeout);
         resolve();
       });
       this.imap.end();
     });
+    this.isConnected = false;
   }
 
-  async getMailboxes(): Promise<ImapBoxes> {
+  async testConnection(): Promise<OperationResult> {
+    await this.connect();
+    await this.withTimeout(this.transporter.verify(), 'SMTP verification');
+    return {
+      status: 'success',
+      message:
+        'Email connection test successful - both IMAP and SMTP are working',
+    };
+  }
+
+  private getBoxesRaw(): Promise<ImapBoxes> {
     return new Promise((resolve, reject) => {
-      this.imap.getBoxes((err: Error, boxes: ImapBoxes) => {
-        if (err) {
-          reject(err);
+      this.imap.getBoxes((error: Error, boxes: ImapBoxes) => {
+        if (error) reject(error);
+        else resolve(boxes);
+      });
+    });
+  }
+
+  private serializeMailboxes(boxes: ImapBoxes): MailboxInfo[] {
+    return Object.entries(boxes).map(([name, box]) => ({
+      name,
+      attributes: box.attribs ?? [],
+      delimiter: box.delimiter,
+      children: box.children
+        ? this.serializeMailboxes(box.children)
+        : undefined,
+    }));
+  }
+
+  async getMailboxes(): Promise<MailboxInfo[]> {
+    return this.runSerialized('List mailboxes', async () =>
+      this.serializeMailboxes(await this.getBoxesRaw())
+    );
+  }
+
+  private normalizeMessageIds(messageIds: string[]): number[] {
+    const ids = [...new Set(messageIds.map(Number))];
+    if (
+      ids.length === 0 ||
+      ids.some((id) => !Number.isSafeInteger(id) || id <= 0)
+    ) {
+      throw new Error(
+        'Message IDs must be positive IMAP UIDs returned by get_messages or search_messages'
+      );
+    }
+    return ids;
+  }
+
+  private headerText(headers: Headers, name: string): string {
+    const value = headers.get(name);
+    if (!value) return '';
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.map(String).join(', ');
+    if (value instanceof Date) return value.toISOString();
+    if ('text' in value) return (value as AddressObject).text;
+    return '';
+  }
+
+  private truncateBody(body: string): { body: string; truncated: boolean } {
+    const bytes = Buffer.from(body);
+    if (bytes.length <= this.bodyLimitBytes) {
+      return { body, truncated: false };
+    }
+    return {
+      body: bytes.subarray(0, this.bodyLimitBytes).toString('utf8'),
+      truncated: true,
+    };
+  }
+
+  private parseMessageStream(
+    stream: NodeJS.ReadableStream,
+    getAttributes: () => ImapMessageAttributes,
+    fallbackUid: number
+  ): Promise<EmailMessage> {
+    return new Promise((resolve, reject) => {
+      const parser = new MailParser({
+        skipHtmlToText: true,
+        skipTextToHtml: true,
+        maxHtmlLengthToParse: this.bodyLimitBytes,
+      });
+      let headers = new Map() as Headers;
+      let body = '';
+      const attachmentPromises: Promise<void>[] = [];
+      const attachments: Attachment[] = [];
+
+      parser.once('headers', (value: Headers) => {
+        headers = value;
+      });
+      parser.on('data', (part) => {
+        if (part.type === 'text') {
+          body = part.text || (typeof part.html === 'string' ? part.html : '');
           return;
         }
-        resolve(boxes);
+
+        const index = attachments.length;
+        const attachment = {
+          index,
+          filename: part.filename || 'unknown',
+          contentType: part.contentType || 'application/octet-stream',
+          size: part.size || 0,
+        };
+        attachments.push(attachment);
+        attachmentPromises.push(
+          new Promise<void>((resolveAttachment, rejectAttachment) => {
+            let size = 0;
+            part.content.on('data', (chunk: Buffer | string) => {
+              size += Buffer.byteLength(chunk);
+            });
+            part.content.once('error', rejectAttachment);
+            part.content.once('end', () => {
+              attachment.size = size;
+              part.release();
+              resolveAttachment();
+            });
+          })
+        );
+      });
+      parser.once('error', reject);
+      stream.once('error', (error) => {
+        parser.destroy();
+        reject(error);
+      });
+      parser.once('end', () => {
+        void Promise.all(attachmentPromises).then(() => {
+          const attributes = getAttributes();
+          const truncated = this.truncateBody(body);
+          const dateHeader = headers.get('date');
+          resolve({
+            id: String(attributes.uid ?? fallbackUid),
+            from: this.headerText(headers, 'from'),
+            to: this.headerText(headers, 'to')
+              .split(',')
+              .map((address) => address.trim())
+              .filter(Boolean),
+            subject: this.headerText(headers, 'subject'),
+            body: truncated.body,
+            bodyTruncated: truncated.truncated,
+            date:
+              dateHeader instanceof Date
+                ? dateHeader
+                : (attributes.date ?? new Date(0)),
+            flags: attributes.flags ?? [],
+            attachments: attachments.length > 0 ? attachments : undefined,
+          });
+        }, reject);
+      });
+      stream.pipe(parser);
+    });
+  }
+
+  private fetchMessages(messageIds: number[]): Promise<EmailMessage[]> {
+    return new Promise((resolve, reject) => {
+      const fetch = this.imap.fetch(messageIds, { bodies: '', struct: true });
+      const messages: Promise<EmailMessage>[] = [];
+
+      fetch.on('message', (message: ImapMessage, sequenceNumber: number) => {
+        let attributes: ImapMessageAttributes = {};
+        let parsing: Promise<EmailMessage> | undefined;
+        message.once('attributes', (value) => {
+          attributes = value;
+        });
+        message.on('body', (stream) => {
+          parsing = this.parseMessageStream(
+            stream,
+            () => attributes,
+            sequenceNumber
+          );
+        });
+        messages.push(
+          new Promise<EmailMessage>((resolveMessage, rejectMessage) => {
+            message.once('end', () => {
+              if (!parsing) {
+                rejectMessage(
+                  new Error('IMAP message contained no body stream')
+                );
+                return;
+              }
+              parsing.then(resolveMessage, rejectMessage);
+            });
+          })
+        );
+      });
+      fetch.once('error', reject);
+      fetch.once('end', () => {
+        void Promise.all(messages).then((values) => {
+          const order = new Map(messageIds.map((uid, index) => [uid, index]));
+          values.sort(
+            (left, right) =>
+              (order.get(Number(left.id)) ?? 0) -
+              (order.get(Number(right.id)) ?? 0)
+          );
+          resolve(values);
+        }, reject);
+      });
+    });
+  }
+
+  private openBox(name: string, readOnly: boolean): Promise<void> {
+    return new Promise((resolve, reject) => {
+      this.imap.openBox(name, readOnly, (error: Error) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+  }
+
+  private search(criteria: unknown[]): Promise<number[]> {
+    return new Promise((resolve, reject) => {
+      this.imap.search(criteria, (error: Error, results: number[]) => {
+        if (error) reject(error);
+        else resolve(results ?? []);
       });
     });
   }
 
   async getMessages(
-    mailbox: string = 'INBOX',
-    limit: number = 10,
-    unreadOnly: boolean = false
+    mailbox = 'INBOX',
+    limit = 10,
+    unreadOnly = false
   ): Promise<EmailMessage[]> {
-    return new Promise((resolve, reject) => {
-      this.imap.openBox(mailbox, true, (err: Error) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        const searchCriteria = unreadOnly ? ['UNSEEN'] : ['ALL'];
-
-        this.imap.search(searchCriteria, (err: Error, results: number[]) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve([]);
-            return;
-          }
-
-          const messageIds = results.slice(-limit);
-          const fetch = this.imap.fetch(messageIds, {
-            bodies: '',
-            struct: true,
-          });
-
-          const messages: EmailMessage[] = [];
-
-          fetch.on('message', (msg: ImapMessage, seqno: number) => {
-            let emailData = '';
-
-            msg.on('body', (stream: NodeJS.ReadableStream) => {
-              stream.on('data', (chunk: Buffer) => {
-                emailData += chunk.toString('utf8');
-              });
-
-              stream.once('end', async () => {
-                try {
-                  const parsed: ParsedMail = await simpleParser(emailData);
-
-                  const attachments: Attachment[] = [];
-                  if (parsed.attachments) {
-                    parsed.attachments.forEach((att: MailparserAttachment) => {
-                      attachments.push({
-                        filename: att.filename || 'unknown',
-                        contentType:
-                          att.contentType || 'application/octet-stream',
-                        size: att.size || 0,
-                        data: att.content,
-                      });
-                    });
-                  }
-
-                  const getEmailText = (
-                    addr:
-                      | MailparserAddressObject
-                      | MailparserAddressObject[]
-                      | undefined
-                  ) => {
-                    if (!addr) return '';
-                    if (Array.isArray(addr))
-                      return addr.map((a) => a.text).join(', ');
-                    return addr.text;
-                  };
-
-                  const emailMessage: EmailMessage = {
-                    id: parsed.messageId || `${seqno}`,
-                    from: getEmailText(parsed.from),
-                    to: parsed.to
-                      ? Array.isArray(parsed.to)
-                        ? parsed.to.map((t) => getEmailText(t))
-                        : [getEmailText(parsed.to)]
-                      : [],
-                    subject: parsed.subject || '',
-                    body: parsed.text || parsed.html || '',
-                    date: parsed.date || new Date(),
-                    flags: [],
-                    attachments:
-                      attachments.length > 0 ? attachments : undefined,
-                  };
-
-                  messages.push(emailMessage);
-                } catch (parseError) {
-                  console.error('Error parsing email:', parseError);
-                }
-              });
-            });
-
-            msg.once('attributes', (attrs: ImapMessageAttributes) => {
-              if (attrs.flags) {
-                const lastMessage = messages[messages.length - 1];
-                if (lastMessage) {
-                  lastMessage.flags = attrs.flags;
-                }
-              }
-            });
-          });
-
-          fetch.once('error', (fetchErr: Error) => {
-            reject(fetchErr);
-          });
-
-          fetch.once('end', () => {
-            resolve(messages);
-          });
-        });
-      });
+    return this.runSerialized('Get messages', async () => {
+      await this.openBox(mailbox, true);
+      const results = await this.search(unreadOnly ? ['UNSEEN'] : ['ALL']);
+      if (results.length === 0) return [];
+      return this.fetchMessages(results.slice(-limit).reverse());
     });
   }
 
   async sendEmail(options: SendEmailOptions): Promise<{ messageId: string }> {
-    const mailOptions: nodemailer.SendMailOptions = {
-      from: this.config.email,
-      to: options.to,
-      subject: options.subject,
-    };
-
-    if (options.text) {
-      mailOptions.text = options.text;
-    }
-
-    if (options.html) {
-      mailOptions.html = options.html;
-    }
-
-    if (options.attachments) {
-      mailOptions.attachments = options.attachments.map((att) => ({
-        filename: att.filename,
-        path: att.path,
-        content: att.content,
-        contentType: att.contentType,
-      }));
-    }
-
-    const info = await this.transporter.sendMail(mailOptions);
+    const info = await this.withTimeout(
+      this.transporter.sendMail({
+        from: this.config.email,
+        to: options.to,
+        subject: options.subject,
+        text: options.text,
+        html: options.html,
+        attachments: options.attachments,
+      }),
+      'Send email'
+    );
     return { messageId: info.messageId };
   }
 
-  async markAsRead(
-    _messageIds: string[],
-    mailbox: string = 'INBOX'
-  ): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.imap.openBox(mailbox, false, (err: Error) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        this.imap.search(['ALL'], (err: Error, results: number[]) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve();
-            return;
-          }
-
-          this.imap.addFlags(results, ['\\Seen'], (err: Error) => {
-            if (err) {
-              reject(err);
-              return;
-            }
-            resolve();
-          });
-        });
+  async markAsRead(messageIds: string[], mailbox = 'INBOX'): Promise<void> {
+    return this.runSerialized('Mark messages as read', async () => {
+      await this.openBox(mailbox, false);
+      await new Promise<void>((resolve, reject) => {
+        this.imap.addFlags(
+          this.normalizeMessageIds(messageIds),
+          ['\\Seen'],
+          (error: Error) => (error ? reject(error) : resolve())
+        );
       });
     });
   }
 
-  async createMailbox(
-    name: string
-  ): Promise<{ status: string; message: string }> {
-    return new Promise((resolve) => {
-      this.imap.addBox(name, (err: Error) => {
-        if (err) {
-          resolve({
-            status: 'error',
-            message: err.message,
+  async createMailbox(name: string): Promise<OperationResult> {
+    return this.runSerialized(
+      'Create mailbox',
+      () =>
+        new Promise((resolve, reject) => {
+          this.imap.addBox(name, (error: Error) => {
+            if (error) reject(error);
+            else
+              resolve({
+                status: 'success',
+                message: `Mailbox '${name}' created successfully`,
+              });
           });
-          return;
-        }
-
-        resolve({
-          status: 'success',
-          message: `Mailbox '${name}' created successfully`,
-        });
-      });
-    });
+        })
+    );
   }
 
-  async deleteMailbox(
-    name: string
-  ): Promise<{ status: string; message: string }> {
-    if (!name || name.trim() === '') {
-      return {
-        status: 'error',
-        message: 'Mailbox name cannot be empty',
-      };
+  private flattenMailboxes(
+    boxes: ImapBoxes,
+    parent = ''
+  ): Array<{ name: string; attributes: string[] }> {
+    const result: Array<{ name: string; attributes: string[] }> = [];
+    for (const [leaf, box] of Object.entries(boxes)) {
+      const name = parent ? `${parent}${box.delimiter}${leaf}` : leaf;
+      result.push({ name, attributes: box.attribs ?? [] });
+      if (box.children)
+        result.push(...this.flattenMailboxes(box.children, name));
     }
+    return result;
+  }
 
-    const trimmedName = name.trim();
+  async deleteMailbox(name: string): Promise<OperationResult> {
+    return this.runSerialized('Delete mailbox', async () => {
+      const boxes = this.flattenMailboxes(await this.getBoxesRaw());
+      const mailbox = boxes.find((box) => box.name === name);
+      if (!mailbox) throw new Error(`Mailbox '${name}' does not exist`);
+      const protectedAttributes = new Set([
+        '\\inbox',
+        '\\sent',
+        '\\trash',
+        '\\drafts',
+        '\\junk',
+        '\\all',
+        '\\archive',
+        '\\flagged',
+        '\\important',
+        '\\noselect',
+      ]);
+      const isProtected =
+        name.toUpperCase() === 'INBOX' ||
+        mailbox.attributes.some((attribute) =>
+          protectedAttributes.has(attribute.toLowerCase())
+        );
+      if (isProtected)
+        throw new Error(`Cannot delete system mailbox '${name}'`);
 
-    // Prevent deletion of important system mailboxes
-    const systemMailboxes = ['INBOX', 'Sent', 'Trash', 'Drafts', 'Junk'];
-    if (systemMailboxes.includes(trimmedName)) {
-      return {
-        status: 'error',
-        message: `Cannot delete system mailbox '${trimmedName}'`,
-      };
-    }
-
-    return new Promise((resolve) => {
-      this.imap.delBox(trimmedName, (err: Error) => {
-        if (err) {
-          let errorMessage = err.message;
-
-          // Provide more helpful error messages for common issues
-          if (err.message.includes('does not exist')) {
-            errorMessage = `Mailbox '${trimmedName}' does not exist`;
-          } else if (err.message.includes('not empty')) {
-            errorMessage = `Cannot delete mailbox '${trimmedName}' because it contains messages. Please move or delete all messages first.`;
-          } else if (err.message.includes('permission')) {
-            errorMessage = `Permission denied: Cannot delete mailbox '${trimmedName}'`;
-          }
-
-          resolve({
-            status: 'error',
-            message: errorMessage,
-          });
-          return;
-        }
-
-        resolve({
-          status: 'success',
-          message: `Mailbox '${trimmedName}' deleted successfully`,
-        });
+      await new Promise<void>((resolve, reject) => {
+        this.imap.delBox(name, (error: Error) =>
+          error ? reject(error) : resolve()
+        );
       });
+      return {
+        status: 'success',
+        message: `Mailbox '${name}' deleted successfully`,
+      };
     });
   }
 
   async moveMessages(
-    _messageIds: string[],
+    messageIds: string[],
     sourceMailbox: string,
     destinationMailbox: string
-  ): Promise<{ status: string; message: string }> {
-    return new Promise((resolve) => {
-      this.imap.openBox(sourceMailbox, false, (err: Error) => {
-        if (err) {
-          resolve({
-            status: 'error',
-            message: `Failed to open source mailbox '${sourceMailbox}': ${err.message}`,
-          });
-          return;
-        }
-
-        // Search for all messages to get sequence numbers
-        this.imap.search(['ALL'], (err: Error, results: number[]) => {
-          if (err) {
-            resolve({
-              status: 'error',
-              message: `Failed to search messages: ${err.message}`,
-            });
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve({
-              status: 'error',
-              message: 'No messages found in source mailbox',
-            });
-            return;
-          }
-
-          // Use the sequence numbers for moving
-          this.imap.move(results, destinationMailbox, (err: Error) => {
-            if (err) {
-              resolve({
-                status: 'error',
-                message: `Failed to move messages: ${err.message}`,
-              });
-              return;
-            }
-
-            resolve({
-              status: 'success',
-              message: `Successfully moved ${results.length} messages from '${sourceMailbox}' to '${destinationMailbox}'`,
-            });
-          });
-        });
+  ): Promise<OperationResult> {
+    return this.runSerialized('Move messages', async () => {
+      await this.openBox(sourceMailbox, false);
+      const ids = this.normalizeMessageIds(messageIds);
+      await new Promise<void>((resolve, reject) => {
+        this.imap.move(ids, destinationMailbox, (error: Error) =>
+          error ? reject(error) : resolve()
+        );
       });
+      return {
+        status: 'success',
+        message: `Successfully moved ${ids.length} messages from '${sourceMailbox}' to '${destinationMailbox}'`,
+      };
     });
+  }
+
+  private parseSearchDate(value: string): Date {
+    return new Date(`${value}T00:00:00.000Z`);
   }
 
   async searchMessages(options: SearchOptions): Promise<EmailMessage[]> {
@@ -548,516 +664,314 @@ export class iCloudMailClient {
       fromEmail,
       unreadOnly = false,
     } = options;
-
-    return new Promise((resolve, reject) => {
-      this.imap.openBox(mailbox, true, (err: Error) => {
-        if (err) {
-          reject(err);
-          return;
-        }
-
-        type SearchCriterion =
-          | string
-          | [string, string | Date]
-          | [string, [string, string], [string, string]];
-        const searchCriteria: SearchCriterion[] = [];
-
-        if (unreadOnly) {
-          searchCriteria.push('UNSEEN');
-        }
-
-        if (dateFrom) {
-          const date = new Date(dateFrom);
-          if (!isNaN(date.getTime())) {
-            searchCriteria.push(['SINCE', date]);
-          }
-        }
-
-        if (dateTo) {
-          const date = new Date(dateTo);
-          if (!isNaN(date.getTime())) {
-            searchCriteria.push(['BEFORE', date]);
-          }
-        }
-
-        if (fromEmail) {
-          searchCriteria.push(['FROM', fromEmail]);
-        }
-
-        if (query) {
-          searchCriteria.push(['OR', ['SUBJECT', query], ['BODY', query]]);
-        }
-
-        if (searchCriteria.length === 0) {
-          searchCriteria.push('ALL');
-        }
-
-        this.imap.search(searchCriteria, (err: Error, results: number[]) => {
-          if (err) {
-            reject(err);
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve([]);
-            return;
-          }
-
-          const messageIds = results.slice(-limit);
-          const fetch = this.imap.fetch(messageIds, {
-            bodies: '',
-            struct: true,
-          });
-
-          const messages: EmailMessage[] = [];
-
-          fetch.on('message', (msg: ImapMessage, seqno: number) => {
-            let emailData = '';
-
-            msg.on('body', (stream: NodeJS.ReadableStream) => {
-              stream.on('data', (chunk: Buffer) => {
-                emailData += chunk.toString('utf8');
-              });
-
-              stream.once('end', async () => {
-                try {
-                  const parsed: ParsedMail = await simpleParser(emailData);
-
-                  const attachments: Attachment[] = [];
-                  if (parsed.attachments) {
-                    parsed.attachments.forEach((att: MailparserAttachment) => {
-                      attachments.push({
-                        filename: att.filename || 'unknown',
-                        contentType:
-                          att.contentType || 'application/octet-stream',
-                        size: att.size || 0,
-                        data: att.content,
-                      });
-                    });
-                  }
-
-                  const getEmailText = (
-                    addr:
-                      | MailparserAddressObject
-                      | MailparserAddressObject[]
-                      | undefined
-                  ) => {
-                    if (!addr) return '';
-                    if (Array.isArray(addr))
-                      return addr.map((a) => a.text).join(', ');
-                    return addr.text;
-                  };
-
-                  const emailMessage: EmailMessage = {
-                    id: parsed.messageId || `${seqno}`,
-                    from: getEmailText(parsed.from),
-                    to: parsed.to
-                      ? Array.isArray(parsed.to)
-                        ? parsed.to.map((t) => getEmailText(t))
-                        : [getEmailText(parsed.to)]
-                      : [],
-                    subject: parsed.subject || '',
-                    body: parsed.text || parsed.html || '',
-                    date: parsed.date || new Date(),
-                    flags: [],
-                    attachments:
-                      attachments.length > 0 ? attachments : undefined,
-                  };
-
-                  messages.push(emailMessage);
-                } catch (parseError) {
-                  console.error('Error parsing email:', parseError);
-                }
-              });
-            });
-
-            msg.once('attributes', (attrs: ImapMessageAttributes) => {
-              if (attrs.flags) {
-                const lastMessage = messages[messages.length - 1];
-                if (lastMessage) {
-                  lastMessage.flags = attrs.flags;
-                }
-              }
-            });
-          });
-
-          fetch.once('error', (fetchErr: Error) => {
-            reject(fetchErr);
-          });
-
-          fetch.once('end', () => {
-            resolve(messages);
-          });
-        });
-      });
+    return this.runSerialized('Search messages', async () => {
+      await this.openBox(mailbox, true);
+      const criteria: unknown[] = [];
+      if (unreadOnly) criteria.push('UNSEEN');
+      if (dateFrom) criteria.push(['SINCE', this.parseSearchDate(dateFrom)]);
+      if (dateTo) {
+        const exclusiveEnd = this.parseSearchDate(dateTo);
+        exclusiveEnd.setUTCDate(exclusiveEnd.getUTCDate() + 1);
+        criteria.push(['BEFORE', exclusiveEnd]);
+      }
+      if (fromEmail) criteria.push(['FROM', fromEmail]);
+      if (query) criteria.push(['OR', ['SUBJECT', query], ['BODY', query]]);
+      const results = await this.search(
+        criteria.length > 0 ? criteria : ['ALL']
+      );
+      if (results.length === 0) return [];
+      return this.fetchMessages(results.slice(-limit).reverse());
     });
   }
 
   async deleteMessages(
-    _messageIds: string[],
-    mailbox: string = 'INBOX'
-  ): Promise<{ status: string; message: string }> {
-    return new Promise((resolve) => {
-      this.imap.openBox(mailbox, false, (err: Error) => {
-        if (err) {
-          resolve({
-            status: 'error',
-            message: `Failed to open mailbox '${mailbox}': ${err.message}`,
-          });
-          return;
-        }
-
-        this.imap.search(['ALL'], (err: Error, results: number[]) => {
-          if (err) {
-            resolve({
-              status: 'error',
-              message: `Failed to search messages: ${err.message}`,
-            });
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve({
-              status: 'error',
-              message: 'No messages found in mailbox',
-            });
-            return;
-          }
-
-          this.imap.addFlags(results, ['\\Deleted'], (err: Error) => {
-            if (err) {
-              resolve({
-                status: 'error',
-                message: `Failed to mark messages for deletion: ${err.message}`,
-              });
-              return;
-            }
-
-            this.imap.expunge((err: Error) => {
-              if (err) {
-                resolve({
-                  status: 'error',
-                  message: `Failed to expunge deleted messages: ${err.message}`,
-                });
-                return;
-              }
-
-              resolve({
-                status: 'success',
-                message: `Successfully deleted ${results.length} messages from '${mailbox}'`,
-              });
-            });
-          });
-        });
+    messageIds: string[],
+    mailbox = 'INBOX'
+  ): Promise<OperationResult> {
+    return this.runSerialized('Delete messages', async () => {
+      await this.openBox(mailbox, false);
+      const ids = this.normalizeMessageIds(messageIds);
+      await new Promise<void>((resolve, reject) => {
+        this.imap.addFlags(ids, ['\\Deleted'], (error: Error) =>
+          error ? reject(error) : resolve()
+        );
       });
+      await new Promise<void>((resolve, reject) => {
+        this.imap.expunge(ids, (error: Error) =>
+          error ? reject(error) : resolve()
+        );
+      });
+      return {
+        status: 'success',
+        message: `Successfully deleted ${ids.length} messages from '${mailbox}'`,
+      };
     });
   }
 
   async setFlags(
-    _messageIds: string[],
+    messageIds: string[],
     flags: string[],
-    mailbox: string = 'INBOX',
+    mailbox = 'INBOX',
     action: 'add' | 'remove' = 'add'
-  ): Promise<{ status: string; message: string }> {
-    return new Promise((resolve) => {
-      this.imap.openBox(mailbox, false, (err: Error) => {
-        if (err) {
-          resolve({
-            status: 'error',
-            message: `Failed to open mailbox '${mailbox}': ${err.message}`,
-          });
+  ): Promise<OperationResult> {
+    return this.runSerialized('Set message flags', async () => {
+      await this.openBox(mailbox, false);
+      const ids = this.normalizeMessageIds(messageIds);
+      await new Promise<void>((resolve, reject) => {
+        const callback = (error: Error) => (error ? reject(error) : resolve());
+        if (action === 'add') this.imap.addFlags(ids, flags, callback);
+        else this.imap.delFlags(ids, flags, callback);
+      });
+      return {
+        status: 'success',
+        message: `Successfully ${action === 'add' ? 'added' : 'removed'} flags [${flags.join(', ')}] ${action === 'add' ? 'to' : 'from'} ${ids.length} messages in '${mailbox}'`,
+      };
+    });
+  }
+
+  private findAttachmentParts(structure: unknown): MimePart[] {
+    const parts: MimePart[] = [];
+    const visit = (value: unknown) => {
+      if (Array.isArray(value)) {
+        value.forEach(visit);
+        return;
+      }
+      if (!value || typeof value !== 'object') return;
+      const part = value as MimePart;
+      const filename = part.disposition?.params?.filename ?? part.params?.name;
+      const disposition = part.disposition?.type?.toLowerCase();
+      if (part.partID && (filename || disposition === 'attachment'))
+        parts.push(part);
+    };
+    visit(structure);
+    return parts;
+  }
+
+  private fetchStructure(uid: number): Promise<MimePart[]> {
+    return new Promise((resolve, reject) => {
+      const fetch = this.imap.fetch([uid], {
+        bodies: 'HEADER.FIELDS (SUBJECT)',
+        struct: true,
+      });
+      let found = false;
+      let parts: MimePart[] = [];
+      fetch.on('message', (message: ImapMessage) => {
+        found = true;
+        message.on('body', (stream) => stream.resume());
+        message.once('attributes', (attributes) => {
+          parts = this.findAttachmentParts(attributes.struct);
+        });
+      });
+      fetch.once('error', reject);
+      fetch.once('end', () => {
+        if (!found) reject(new Error(`Message with UID '${uid}' not found`));
+        else resolve(parts);
+      });
+    });
+  }
+
+  private decodeAttachmentPart(
+    uid: number,
+    part: MimePart,
+    index: number
+  ): Promise<AttachmentResult> {
+    return new Promise((resolve, reject) => {
+      const fetch = this.imap.fetch([uid], { bodies: part.partID ?? '' });
+      let found = false;
+      let decoding: Promise<AttachmentResult> | undefined;
+      fetch.on('message', (message: ImapMessage) => {
+        found = true;
+        message.on('body', (stream) => {
+          decoding = new Promise<AttachmentResult>(
+            (resolveAttachment, rejectAttachment) => {
+              const parser = new MailParser();
+              const sink = new PassThrough();
+              const filename =
+                part.disposition?.params?.filename ??
+                part.params?.name ??
+                `attachment-${index}`;
+              const contentType =
+                `${part.type ?? 'application'}/${part.subtype ?? 'octet-stream'}`.toLowerCase();
+              const chunks: Buffer[] = [];
+              let size = 0;
+              let emitted = false;
+
+              parser.on('data', (data) => {
+                if (data.type !== 'attachment') return;
+                emitted = true;
+                data.content.on('data', (chunk: Buffer | string) => {
+                  const buffer = Buffer.isBuffer(chunk)
+                    ? chunk
+                    : Buffer.from(chunk);
+                  size += buffer.length;
+                  if (size <= this.attachmentLimitBytes) chunks.push(buffer);
+                });
+                data.content.once('error', rejectAttachment);
+                data.content.once('end', () => {
+                  data.release();
+                  if (size > this.attachmentLimitBytes) {
+                    rejectAttachment(
+                      new Error('Attachment exceeds the 10 MiB download limit')
+                    );
+                    return;
+                  }
+                  resolveAttachment({
+                    status: 'success',
+                    message: `Successfully downloaded attachment '${filename}'`,
+                    attachment: {
+                      filename,
+                      contentType,
+                      size,
+                      data: Buffer.concat(chunks).toString('base64'),
+                    },
+                  });
+                });
+              });
+              parser.once('error', rejectAttachment);
+              parser.once('end', () => {
+                if (!emitted)
+                  rejectAttachment(new Error('Unable to decode attachment'));
+              });
+              sink.pipe(parser);
+              const safeFilename = filename.replace(/["\r\n]/gu, '_');
+              sink.write(
+                `Content-Type: ${contentType}; name="${safeFilename}"\r\nContent-Disposition: attachment; filename="${safeFilename}"\r\nContent-Transfer-Encoding: ${part.encoding ?? '7bit'}\r\n\r\n`
+              );
+              stream.on('data', (chunk) => sink.write(chunk));
+              stream.once('error', rejectAttachment);
+              stream.once('end', () => sink.end());
+            }
+          );
+        });
+      });
+      fetch.once('error', reject);
+      fetch.once('end', () => {
+        if (!found || !decoding) {
+          reject(new Error(`Message with UID '${uid}' not found`));
           return;
         }
-
-        this.imap.search(['ALL'], (err: Error, results: number[]) => {
-          if (err) {
-            resolve({
-              status: 'error',
-              message: `Failed to search messages: ${err.message}`,
-            });
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve({
-              status: 'error',
-              message: 'No messages found in mailbox',
-            });
-            return;
-          }
-
-          const flagOperation = action === 'add' ? 'addFlags' : 'delFlags';
-
-          this.imap[flagOperation](results, flags, (err: Error) => {
-            if (err) {
-              resolve({
-                status: 'error',
-                message: `Failed to ${action} flags: ${err.message}`,
-              });
-              return;
-            }
-
-            resolve({
-              status: 'success',
-              message: `Successfully ${action === 'add' ? 'added' : 'removed'} flags [${flags.join(', ')}] ${action === 'add' ? 'to' : 'from'} ${results.length} messages in '${mailbox}'`,
-            });
-          });
-        });
+        decoding.then(resolve, reject);
       });
     });
   }
 
   async downloadAttachment(
     messageId: string,
-    attachmentIndex: number = 0,
-    mailbox: string = 'INBOX'
-  ): Promise<{
-    status: string;
-    message: string;
-    attachment?: {
-      filename: string;
-      contentType: string;
-      size: number;
-      data: string;
-    };
-  }> {
-    return new Promise((resolve) => {
-      this.imap.openBox(mailbox, true, (err: Error) => {
-        if (err) {
-          resolve({
-            status: 'error',
-            message: `Failed to open mailbox '${mailbox}': ${err.message}`,
-          });
-          return;
-        }
-
-        this.imap.search(['ALL'], (err: Error, results: number[]) => {
-          if (err) {
-            resolve({
-              status: 'error',
-              message: `Failed to search messages: ${err.message}`,
-            });
-            return;
-          }
-
-          if (!results || results.length === 0) {
-            resolve({
-              status: 'error',
-              message: 'No messages found in mailbox',
-            });
-            return;
-          }
-
-          const fetch = this.imap.fetch(results, {
-            bodies: '',
-            struct: true,
-          });
-
-          let found = false;
-
-          fetch.on('message', (msg: ImapMessage, seqno: number) => {
-            if (found) return;
-
-            let emailData = '';
-
-            msg.on('body', (stream: NodeJS.ReadableStream) => {
-              stream.on('data', (chunk: Buffer) => {
-                emailData += chunk.toString('utf8');
-              });
-
-              stream.once('end', async () => {
-                try {
-                  const parsed: ParsedMail = await simpleParser(emailData);
-
-                  if (
-                    parsed.messageId === messageId ||
-                    `${seqno}` === messageId
-                  ) {
-                    found = true;
-
-                    if (
-                      !parsed.attachments ||
-                      parsed.attachments.length === 0
-                    ) {
-                      resolve({
-                        status: 'error',
-                        message: 'No attachments found in the message',
-                      });
-                      return;
-                    }
-
-                    if (attachmentIndex >= parsed.attachments.length) {
-                      resolve({
-                        status: 'error',
-                        message: `Attachment index ${attachmentIndex} out of range. Message has ${parsed.attachments.length} attachments`,
-                      });
-                      return;
-                    }
-
-                    const attachment = parsed.attachments[attachmentIndex];
-
-                    resolve({
-                      status: 'success',
-                      message: `Successfully downloaded attachment '${attachment.filename}'`,
-                      attachment: {
-                        filename: attachment.filename || 'unknown',
-                        contentType:
-                          attachment.contentType || 'application/octet-stream',
-                        size: attachment.size || 0,
-                        data: attachment.content.toString('base64'),
-                      },
-                    });
-                  }
-                } catch (parseError) {
-                  console.error('Error parsing email:', parseError);
-                }
-              });
-            });
-          });
-
-          fetch.once('error', (fetchErr: Error) => {
-            resolve({
-              status: 'error',
-              message: `Failed to fetch messages: ${fetchErr.message}`,
-            });
-          });
-
-          fetch.once('end', () => {
-            if (!found) {
-              resolve({
-                status: 'error',
-                message: `Message with ID '${messageId}' not found`,
-              });
-            }
-          });
-        });
-      });
+    attachmentIndex = 0,
+    mailbox = 'INBOX'
+  ): Promise<AttachmentResult> {
+    return this.runSerialized('Download attachment', async () => {
+      await this.openBox(mailbox, true);
+      const uid = this.normalizeMessageIds([messageId])[0];
+      const parts = await this.fetchStructure(uid);
+      if (parts.length === 0)
+        throw new Error('No attachments found in the message');
+      if (attachmentIndex >= parts.length) {
+        throw new Error(
+          `Attachment index ${attachmentIndex} out of range. Message has ${parts.length} attachments`
+        );
+      }
+      const part = parts[attachmentIndex];
+      if ((part.size ?? 0) > this.attachmentLimitBytes) {
+        throw new Error('Attachment exceeds the 10 MiB download limit');
+      }
+      return this.decodeAttachmentPart(uid, part, attachmentIndex);
     });
   }
 
   async autoOrganize(
     rules: OrganizationRule[],
-    sourceMailbox: string = 'INBOX',
-    dryRun: boolean = false
-  ): Promise<{
-    status: string;
-    message: string;
-    results: Array<{
-      rule: string;
-      matchedMessages: number;
-      moved: boolean;
-      messages?: Array<{
-        id: string;
-        from: string;
-        subject: string;
-        destinationMailbox: string;
-      }>;
-    }>;
-  }> {
-    try {
-      const messages = await this.getMessages(sourceMailbox, 100);
-      const results: Array<{
-        rule: string;
-        matchedMessages: number;
-        moved: boolean;
-        messages?: Array<{
-          id: string;
-          from: string;
-          subject: string;
-          destinationMailbox: string;
-        }>;
-      }> = [];
+    sourceMailbox = 'INBOX',
+    dryRun = true
+  ): Promise<OrganizationResult> {
+    const [messages, mailboxes] = await Promise.all([
+      this.getMessages(sourceMailbox, 100),
+      this.getMailboxes(),
+    ]);
+    const available = new Set<string>();
+    const collect = (items: MailboxInfo[], parent = '') => {
+      for (const item of items) {
+        const name = parent
+          ? `${parent}${item.delimiter}${item.name}`
+          : item.name;
+        available.add(name);
+        if (item.children) collect(item.children, name);
+      }
+    };
+    collect(mailboxes);
+    for (const rule of rules) {
+      if (!available.has(rule.action.moveToMailbox)) {
+        throw new Error(
+          `Destination mailbox '${rule.action.moveToMailbox}' for rule '${rule.name}' does not exist`
+        );
+      }
+    }
 
-      for (const rule of rules) {
-        const matchedMessages: Array<{
-          id: string;
-          from: string;
-          subject: string;
-          destinationMailbox: string;
-        }> = [];
+    const assignments = rules.map(() => [] as typeof messages);
+    for (const message of messages) {
+      const ruleIndex = rules.findIndex((candidate) => {
+        const fromMatches = candidate.condition.fromContains
+          ? message.from
+              .toLowerCase()
+              .includes(candidate.condition.fromContains.toLowerCase())
+          : false;
+        const subjectMatches = candidate.condition.subjectContains
+          ? message.subject
+              .toLowerCase()
+              .includes(candidate.condition.subjectContains.toLowerCase())
+          : false;
+        return fromMatches || subjectMatches;
+      });
+      if (ruleIndex >= 0) assignments[ruleIndex].push(message);
+    }
 
-        for (const message of messages) {
-          let matches = false;
-
-          if (rule.condition.fromContains) {
-            matches =
-              matches ||
-              message.from
-                .toLowerCase()
-                .includes(rule.condition.fromContains.toLowerCase());
-          }
-
-          if (rule.condition.subjectContains) {
-            matches =
-              matches ||
-              message.subject
-                .toLowerCase()
-                .includes(rule.condition.subjectContains.toLowerCase());
-          }
-
-          if (matches) {
-            matchedMessages.push({
-              id: message.id,
-              from: message.from,
-              subject: message.subject,
-              destinationMailbox: rule.action.moveToMailbox,
-            });
-          }
-        }
-
-        if (matchedMessages.length > 0) {
-          let moved = false;
-
-          if (!dryRun) {
-            try {
-              const messageIds = matchedMessages.map((m) => m.id);
-              await this.moveMessages(
-                messageIds,
-                sourceMailbox,
-                rule.action.moveToMailbox
-              );
-              moved = true;
-            } catch (moveError) {
-              console.error(
-                `Failed to move messages for rule '${rule.name}':`,
-                moveError
-              );
-            }
-          }
-
-          results.push({
-            rule: rule.name,
-            matchedMessages: matchedMessages.length,
-            moved: !dryRun && moved,
-            messages: matchedMessages,
-          });
-        } else {
-          results.push({
-            rule: rule.name,
-            matchedMessages: 0,
-            moved: false,
-          });
+    let failures = 0;
+    const results: OrganizationResult['results'] = [];
+    for (const [ruleIndex, rule] of rules.entries()) {
+      const matched = assignments[ruleIndex];
+      const summaries = matched.map((message) => ({
+        id: message.id,
+        from: message.from,
+        subject: message.subject,
+        destinationMailbox: rule.action.moveToMailbox,
+      }));
+      let moved = false;
+      let error: string | undefined;
+      if (!dryRun && matched.length > 0) {
+        try {
+          await this.moveMessages(
+            matched.map((message) => message.id),
+            sourceMailbox,
+            rule.action.moveToMailbox
+          );
+          moved = true;
+        } catch (moveError) {
+          failures += 1;
+          error =
+            moveError instanceof Error ? moveError.message : String(moveError);
         }
       }
-
-      const totalMatched = results.reduce(
-        (sum, result) => sum + result.matchedMessages,
-        0
-      );
-
-      return {
-        status: 'success',
-        message: dryRun
-          ? `Dry run completed. Found ${totalMatched} messages matching organization rules`
-          : `Organization completed. Processed ${totalMatched} messages`,
-        results,
-      };
-    } catch (error) {
-      return {
-        status: 'error',
-        message: `Failed to organize emails: ${error instanceof Error ? error.message : String(error)}`,
-        results: [],
-      };
+      results.push({
+        rule: rule.name,
+        matchedMessages: matched.length,
+        moved,
+        ...(error ? { error } : {}),
+        ...(summaries.length > 0 ? { messages: summaries } : {}),
+      });
     }
+
+    const totalMatched = results.reduce(
+      (sum, result) => sum + result.matchedMessages,
+      0
+    );
+    return {
+      status: failures > 0 ? 'partial' : 'success',
+      message: dryRun
+        ? `Dry run completed. Found ${totalMatched} messages matching organization rules`
+        : failures > 0
+          ? `Organization completed with ${failures} failed rule operation(s). Processed ${totalMatched} messages`
+          : `Organization completed. Processed ${totalMatched} messages`,
+      results,
+    };
   }
 }

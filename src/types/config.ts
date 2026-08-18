@@ -8,21 +8,25 @@ export interface iCloudConfig {
 }
 
 export interface EmailMessage {
+  /** Stable IMAP UID. Use this value for message-mutating tools. */
   id: string;
   from: string;
   to: string[];
   subject: string;
   body: string;
+  /** True when the returned body was capped to the server's safety limit. */
+  bodyTruncated: boolean;
   date: Date;
   flags: string[];
   attachments?: Attachment[];
 }
 
 export interface Attachment {
+  /** Zero-based index accepted by download_attachment. */
+  index: number;
   filename: string;
   contentType: string;
   size: number;
-  data: Buffer;
 }
 
 export interface SendEmailOptions {

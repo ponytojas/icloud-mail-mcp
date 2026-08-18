@@ -1,9 +1,22 @@
 {
   "name": "icloud-mail-mcp",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Model Context Protocol server for iCloud Mail management and email operations",
   "type": "module",
+  "packageManager": "pnpm@10.33.0",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "icloud-mail-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "dev": "node --inspect dist/index.js",
@@ -15,7 +28,9 @@
     "format:check": "prettier --check .",
     "test": "vitest",
     "test:ui": "vitest --ui",
-    "test:run": "vitest run"
+    "test:run": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "smoke:package": "pnpm build && node scripts/package-smoke.mjs"
   },
   "keywords": [
     "mcp",
@@ -34,18 +49,20 @@
     "url": "https://github.com/minagishl/icloud-mail-mcp/issues"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.17.2",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "imap": "^0.8.19",
-    "mailparser": "^3.7.4",
-    "nodemailer": "^7.0.5"
+    "mailparser": "^3.9.14",
+    "nodemailer": "^9.0.3",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@eslint/js": "^9.33.0",
     "@types/imap": "^0.8.42",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^24.2.1",
-    "@types/nodemailer": "^6.4.17",
+    "@types/nodemailer": "^8.0.1",
     "@vitest/ui": "^3.2.4",
+    "@vitest/coverage-v8": "3.2.4",
     "esbuild": "^0.25.8",
     "eslint": "^9.33.0",
     "eslint-config-prettier": "^10.1.8",
@@ -57,6 +74,16 @@
     "vitest": "^3.2.4"
   },
   "pnpm": {
+    "overrides": {
+      "path-to-regexp": "8.4.0",
+      "semver@5.3.0": "5.7.2",
+      "fast-uri": "3.1.5",
+      "ip-address": "10.3.1",
+      "deepmerge-ts": "8.0.0",
+      "qs": "6.15.2",
+      "hono": "4.12.34",
+      "@hono/node-server": "1.19.15"
+    },
     "ignoredBuiltDependencies": [
       "esbuild"
     ]

@@ -23,6 +23,23 @@ A Model Context Protocol (MCP) server for integrating with iCloud Mail using App
 
 ## Installation
 
+Run the published package directly from an MCP client:
+
+```json
+{
+  "icloud-mail-mcp": {
+    "command": "npx",
+    "args": ["-y", "icloud-mail-mcp@1.2.0"],
+    "env": {
+      "ICLOUD_EMAIL": "your-email@icloud.com",
+      "ICLOUD_APP_PASSWORD": "your-app-specific-password"
+    }
+  }
+}
+```
+
+For local development:
+
 ```bash
 # Clone the repository
 git clone https://github.com/minagishl/icloud-mail-mcp.git
@@ -37,7 +54,7 @@ pnpm run build
 
 ## Configuration
 
-The server requires environment variables to be set for authentication. Configuration is done through your MCP client settings:
+The server requires environment variables for authentication. Configuration is done exclusively through your MCP client settings; there is no runtime configuration tool.
 
 ### Environment Variables (Required)
 
@@ -67,6 +84,8 @@ Add to your MCP server configuration:
 
 Retrieve email messages from a specified mailbox.
 
+Results are newest-first. Bodies are capped and report `bodyTruncated`; attachments include the `index` accepted by `download_attachment`.
+
 **Parameters:**
 
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
@@ -79,10 +98,11 @@ Send an email through iCloud Mail.
 
 **Parameters:**
 
-- `to` (string or array, required): Recipient email address(es)
+- `to` (string or array, required): Valid recipient email address(es), up to 50
 - `subject` (string, required): Email subject
 - `text` (string, optional): Plain text email body
 - `html` (string, optional): HTML email body
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 #### `mark_as_read`
 
@@ -90,8 +110,9 @@ Mark email messages as read.
 
 **Parameters:**
 
-- `messageIds` (array, required): Array of message IDs to mark as read
+- `messageIds` (array, required): Numeric IMAP UIDs returned by a read/search tool
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 #### `move_messages`
 
@@ -99,9 +120,10 @@ Move messages between mailboxes.
 
 **Parameters:**
 
-- `messageIds` (array, required): Array of message IDs to move
+- `messageIds` (array, required): Numeric IMAP UIDs to move
 - `sourceMailbox` (string, required): Source mailbox name
 - `destinationMailbox` (string, required): Destination mailbox name
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 #### `search_messages`
 
@@ -109,11 +131,11 @@ Search for messages using various criteria.
 
 **Parameters:**
 
-- `query` (string, optional): Search query text (searches in subject, from, body)
+- `query` (string, optional): Search query text (searches subject and body)
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
 - `limit` (number, optional): Maximum number of messages to retrieve (default: 10)
 - `dateFrom` (string, optional): Start date for search (YYYY-MM-DD format)
-- `dateTo` (string, optional): End date for search (YYYY-MM-DD format)
+- `dateTo` (string, optional): Inclusive end date (YYYY-MM-DD format)
 - `fromEmail` (string, optional): Filter by sender email address
 - `unreadOnly` (boolean, optional): Search only unread messages (default: false)
 
@@ -123,8 +145,9 @@ Delete messages from a mailbox.
 
 **Parameters:**
 
-- `messageIds` (array, required): Array of message IDs to delete
+- `messageIds` (array, required): Numeric IMAP UIDs to delete
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 #### `set_flags`
 
@@ -132,10 +155,11 @@ Set flags on messages (read, unread, flagged, etc.).
 
 **Parameters:**
 
-- `messageIds` (array, required): Array of message IDs to set flags on
+- `messageIds` (array, required): Numeric IMAP UIDs to change
 - `flags` (array, required): Array of flags to set (e.g., ["\\Seen", "\\Flagged"])
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
 - `action` (string, optional): Whether to "add" or "remove" the flags (default: "add")
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 #### `download_attachment`
 
@@ -143,7 +167,7 @@ Download an attachment from a specific message.
 
 **Parameters:**
 
-- `messageId` (string, required): Message ID containing the attachment
+- `messageId` (string, required): Numeric IMAP UID containing the attachment
 - `attachmentIndex` (number, optional): Index of the attachment to download (0-based, default: 0)
 - `mailbox` (string, optional): Mailbox name (default: "INBOX")
 
@@ -155,7 +179,10 @@ Automatically organize emails based on rules (sender, subject keywords, etc.).
 
 - `rules` (array, required): Array of organization rules with conditions and actions
 - `sourceMailbox` (string, optional): Source mailbox to organize (default: "INBOX")
-- `dryRun` (boolean, optional): If true, only shows what would be organized without moving emails (default: false)
+- `dryRun` (boolean, optional): If true, only shows what would be organized without moving emails (default: true)
+- `confirm` (boolean, conditionally required): Required when `dryRun` is `false`
+
+Rules run in their supplied order and the first matching rule wins. Each scan is intentionally limited to the newest 100 messages in the source mailbox.
 
 **Rule Structure:**
 
@@ -187,6 +214,7 @@ Create a new mailbox (folder) in your iCloud Mail account.
 **Parameters:**
 
 - `name` (string, required): Name of the mailbox to create
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 #### `delete_mailbox`
 
@@ -195,10 +223,11 @@ Delete an existing mailbox (folder) from your iCloud Mail account.
 **Parameters:**
 
 - `name` (string, required): Name of the mailbox to delete
+- `confirm` (boolean, required): Must be `true` after explicit user approval
 
 **Safety Features:**
 
-- Prevents deletion of system mailboxes (INBOX, Sent, Trash, Drafts, Junk)
+- Prevents deletion of system mailboxes using IMAP special-use attributes, including localized folder names
 - Validates mailbox name input
 - Provides detailed error messages for common issues
 
@@ -231,8 +260,6 @@ Check if environment variables are properly configured and show connection statu
 # With environment variables (recommended)
 ICLOUD_EMAIL="your-email@icloud.com" ICLOUD_APP_PASSWORD="your-app-password" pnpm run start
 
-# Or start normally and configure manually
-pnpm run start
 ```
 
 ### Email Operations
@@ -257,7 +284,8 @@ pnpm run start
   "arguments": {
     "to": "recipient@example.com",
     "subject": "Hello from MCP",
-    "text": "This email was sent using the iCloud Mail MCP server!"
+    "text": "This email was sent using the iCloud Mail MCP server!",
+    "confirm": true
   }
 }
 ```
@@ -268,9 +296,10 @@ pnpm run start
 {
   "tool": "move_messages",
   "arguments": {
-    "messageIds": ["message-id-1", "message-id-2"],
+    "messageIds": ["1042", "1043"],
     "sourceMailbox": "INBOX",
-    "destinationMailbox": "My Custom Folder"
+    "destinationMailbox": "My Custom Folder",
+    "confirm": true
   }
 }
 ```
@@ -283,7 +312,8 @@ pnpm run start
 {
   "tool": "create_mailbox",
   "arguments": {
-    "name": "My Custom Folder"
+    "name": "My Custom Folder",
+    "confirm": true
   }
 }
 ```
@@ -294,7 +324,8 @@ pnpm run start
 {
   "tool": "delete_mailbox",
   "arguments": {
-    "name": "My Custom Folder"
+    "name": "My Custom Folder",
+    "confirm": true
   }
 }
 ```
@@ -325,8 +356,14 @@ pnpm run start
 
 - **App Passwords**: Always use app-specific passwords, never your main iCloud password
 - **Secure Storage**: Store your app password securely and never commit it to version control
-- **Connection Security**: All connections use TLS/SSL encryption
+- **Connection Security**: IMAP and SMTP require a valid TLS certificate; self-signed or intercepted certificates are rejected.
 - **Minimal Permissions**: The server only accesses Mail functionality
+- **Message IDs**: The `id` returned by `get_messages` and `search_messages` is an IMAP UID. Pass only those IDs to message-mutating tools; they affect exactly the supplied UIDs.
+- **Explicit confirmation**: Sending mail and every mailbox/message mutation require `confirm: true`. Only set it after the user has reviewed and explicitly approved the precise action.
+- **Consent boundary**: Tool annotations and `confirm` support safer client workflows, but client-side user consent and access controls are the actual security boundary.
+- **Safe automation**: `auto_organize` defaults to `dryRun: true`. Review its planned result first; execution additionally requires `dryRun: false` and `confirm: true`.
+- **Attachments**: Message listing returns attachment metadata only. `download_attachment` is an explicit operation and refuses attachments over 10 MiB.
+- **Untrusted content**: Email bodies and attachments can contain prompt injection or misleading instructions. Treat them as untrusted data and do not let an LLM turn email content into tool calls without independent user review.
 
 ## Development
 
@@ -350,13 +387,18 @@ pnpm run test
 pnpm run lint
 ```
 
+### Temporary Dependency Overrides
+
+`package.json` temporarily pins patched transitive releases used by the MCP SDK, Mailparser, and IMAP (`path-to-regexp`, `semver`, `fast-uri`, `ip-address`, `deepmerge-ts`, `qs`, `hono`, and `@hono/node-server`). These overrides keep `pnpm audit --prod` clean and can be removed as upstream dependency ranges adopt the patched versions.
+
 ## Testing
 
 This project includes comprehensive test coverage using Vitest. The test suite covers:
 
 ### Test Structure
 
-- **Total Tests**: 29 tests across 3 test files
+- **Coverage gates**: At least 80% for statements, lines, and functions and 70% for branches
+- **Current suite**: 37 tests across 3 test files, including in-memory MCP integration tests
 - **Framework**: Vitest with TypeScript support
 - **Coverage**: Core functionality, type definitions, and configuration
 
@@ -364,9 +406,10 @@ This project includes comprehensive test coverage using Vitest. The test suite c
 
 #### 1. Core Client Tests (`src/lib/icloud-mail-client.test.ts`)
 
-- **Constructor validation**: Tests client creation with various configurations
-- **Email name extraction**: Tests handling of different email formats
-- **Basic functionality**: Tests core client behavior and configuration validation
+- **Connection lifecycle**: Authentication fallback, dropped-session reconnection, shutdown, and timeouts
+- **Mailbox safety**: Serialized selection, numeric UID targeting, and localized system-folder protection
+- **Message handling**: Body truncation, parser errors, MIME-part attachment streaming, size limits, and inclusive date searches
+- **Automation**: Ordered first-match behavior and partial move failures
 
 #### 2. Type Definition Tests (`src/types/config.test.ts`)
 
@@ -377,11 +420,11 @@ This project includes comprehensive test coverage using Vitest. The test suite c
 - **OrganizationRule**: Tests email organization rule definitions
 - **Attachment**: Tests attachment data structures
 
-#### 3. Server Configuration Tests (`src/index.test.ts`)
+#### 3. MCP Integration Tests (`src/index.test.ts`)
 
-- **Environment variables**: Tests handling of configuration environment variables
-- **Credential masking**: Tests security functions for hiding sensitive data
-- **Config validation**: Tests basic configuration validation logic
+- **Discovery**: Tool names, schemas, output schemas, and annotations
+- **Validation**: Confirmation guards, dates, recipients, flags, UIDs, and rule definitions
+- **Protocol results**: Structured content, text fallbacks, and `isError` signaling over an in-memory MCP transport
 
 ### Running Tests
 
@@ -394,6 +437,9 @@ pnpm run test
 
 # Run tests with UI interface
 pnpm run test:ui
+
+# Enforce coverage thresholds
+pnpm run test:coverage
 ```
 
 ### Test Features
@@ -417,12 +463,22 @@ pnpm run test:ui
 - Verify internet connectivity
 - Check if iCloud Mail servers are accessible
 - Ensure firewall settings allow connections to imap.mail.me.com and smtp.mail.me.com
+- Dropped IMAP sessions reconnect automatically on the next tool call. If reconnects repeatedly fail, regenerate the app-specific password and restart the MCP client.
 
 ### Email Not Sending
 
 - Verify SMTP settings and authentication
 - Check recipient email addresses are valid
 - Ensure you're not hitting rate limits
+
+### Localized Mailboxes
+
+- Use `get_mailboxes` to discover the exact mailbox path exposed by iCloud. System folders may have localized names and are protected through their IMAP attributes.
+
+### Large Messages and Attachments
+
+- Returned message bodies are capped and include `bodyTruncated: true` when shortened.
+- Listings expose attachment metadata and a zero-based `index` without retaining attachment bytes. `download_attachment` retrieves only that MIME part and rejects downloads over 10 MiB.
 
 ## iCloud Mail Server Settings
 

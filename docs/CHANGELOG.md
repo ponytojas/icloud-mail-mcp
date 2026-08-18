@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.2.0 (2026-08-17)
+
+### Security and reliability
+
+- Added runtime-validated MCP input/output schemas, structured content, annotations, confirmation guards, and MCP error signaling.
+- Serialized IMAP mailbox operations, added reconnection and operation timeouts, retained Apple username/full-address authentication fallback, and added graceful shutdown.
+- Protected localized system mailboxes through IMAP attributes and restricted message mutations to numeric UIDs.
+- Streamed message parsing and selective attachment downloads, capped bodies, and retained the 10 MiB attachment limit.
+- Made organization rules ordered and first-match-wins, with dry-run by default, destination validation, a 100-message scan bound, and partial-failure reporting.
+
+### Packaging and quality
+
+- Added the `icloud-mail-mcp` executable, package file allowlist, clean builds, Node 22/24 CI, tag/version verification, package smoke testing, and enforced coverage thresholds.
+- Updated and pinned vulnerable transitive dependencies so the production dependency audit has no findings.
+
+---
+
 ## v1.1.1 (2025-08-17)
 
 ### Testing Infrastructure
